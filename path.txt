@@ -1,0 +1,32 @@
+# mode is train or  valid 
+for image in dataset:
+    for annotation in image['annotation']:
+        if int(annotation['class_id']) in [rm_['rm_id'] for rm_ in rm_products]:
+            print(annotation['class_id'])
+            for rm in rm_products:
+                if int(rm['rm_id']) == int(annotation['class_id']):
+                    for box in annotation['boxes']:
+                        if int(box['design']) in rm['rm_ds']:
+                                image['modifi_date']=datetime.now().strftime('%Y%m%d%H%M%S')
+                                box['status']=DEACTIVATED_STATE
+                                print(image)
+                   # Change status of [id] to deactivated if all [design] has been deactivated
+                    status_state=[box['status'] for box in annotation['boxes']]
+                    if ACTIVATE_STATE not in status_state:
+                        annotation['status']=DEACTIVATED_STATE
+                        image['modifi_date']=datetime.now().strftime('%Y%m%d%H%M%S')
+                    bk_images.append(image)
+                    ###########
+
+                    #backup
+                    # check exist backup
+                    
+                    new_backup_path=join(bk_path,image['image_name'])
+                    new_back_path_to_save=fr"{model}_dataset\backup\{basename(new_backup_path)}"
+                    if image['backup_path'] is not None and image['backup_path']==new_back_path_to_save and isfile(new_backup_path):
+                        break
+                    else:
+                        shutil.copy(join(DATA_ROOT,image['image_path']),new_backup_path)
+                        image['backup_path']=new_back_path_to_save
+                        break
+            

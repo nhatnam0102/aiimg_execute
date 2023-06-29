@@ -1,0 +1,179 @@
+
+@app.route('/ubuntu_api/update_list_model', methods=["POST"])
+def update_list_model():
+    response = request.get_json()
+    mode = response['mode']
+    model = response['model']
+    status = response['status']
+    name = response['name']
+    folder_name = name.split("_")[1]
+
+    
+    #DELETE mode
+    if mode == 'delete':
+        with open('/var/www/html/aiimg_execute/model/model_manager.json', 'r+', encoding='utf-8') as f:
+            model_list = json.load(f)
+        for model_ in model_list[f'{model}'][f'{status}']:
+            if model_['name'] == name:
+                model_list[f'{model}'][f'{status}'].remove(model_)
+                break
+
+        with open('/var/www/html/aiimg_execute/model/model_manager.json', 'w+', encoding='utf-8') as f:
+            json.dump(model_list, f)
+        if os.path.isdir(os.path.join(MODEL_ROOT, 'uncheck', f'{folder_name}', f'{name}')):
+            shutil.rmtree(os.path.join(MODEL_ROOT, 'uncheck', f'{folder_name}', f'{name}'))
+        # dir empty=> remove
+        if len(os.listdir(os.path.join(MODEL_ROOT, 'uncheck', f'{folder_name}'))) == 0:
+            os.rmdir(os.path.join(MODEL_ROOT, 'uncheck', f'{folder_name}'))
+        return "DEL OK"
+    
+    #CHECK_OK mode
+    if mode == 'check_ok':
+        with open('/var/www/html/aiimg_execute/model/model_manager.json', 'r+', encoding='utf-8') as f:
+            model_list = json.load(f)
+        
+        for model_ in model_list[f'{model}']['uncheck']:
+            if model_['name'] == name:
+                # save old current model 
+                old_current_model=  model_list[f'{model}']['current'][0] if len(model_list[f'{model}']['current'])>0 else None
+             
+                # Set new checked model to current
+                #   Change status to current
+                model_['status'] = '1_current'
+
+                #   Change path to current directory
+                model_['path'] = os.path.join(MODEL_ROOT,"current",f"{name}","weights","best.pt")
+
+                #   Set checked model to current
+                model_list[f'{model}']['current']=[model_]
+
+                #remove checked model from uncheck
+                model_list[f'{model}']['uncheck'].remove(model_)
+
+                path_parent=os.path.join(MODEL_ROOT, 'uncheck', f'{folder_name}')
+                path_child=os.path.join(path_parent,f'{name}')
+
+                #Move uncheck to current in local directory
+                if os.path.isdir(path_child):
+                    shutil.move(path_child,os.path.join(MODEL_ROOT, 'current', f'{name}'))
+                  
+                # dir empty=> remove
+                if len(os.listdir(path_parent)) == 0:
+                    os.rmdir(path_parent)
+                
+                if old_current_model is None:
+                    break
+
+               
+                # Add old_current_model to checked
+                if len(model_list[f'{model}']['checked'])>0:
+                    list_checked_model=[int(mo['date_trained']) for mo in model_list[f'{model}']['checked']]
+                    oldest_model=None
+                    # Remove oldest model if 3 models exist
+                    if len(model_list[f'{model}']['checked'])>=3:
+                        for mo in model_list[f'{model}']['checked']:
+                                if int(mo['date_trained'])== min(list_checked_model):
+                                    oldest_model=mo
+
+                                    #remove at json
+                                    model_list[f'{model}']['checked'].remove(mo)
+
+                                    #remove at local dicrectory
+                                    oldest_model_folder=oldest_model['name'].split('_')[1]
+                                    oldest_model_name=oldest_model['name']
+
+                                    oldest_model_path_parent=os.path.join(MODEL_ROOT, 'checked', f'{oldest_model_folder}')
+                                    oldest_model_path_child=os.path.join(oldest_model_path_parent, f'{oldest_model_name}')
+
+                                    if os.path.isdir(oldest_model_path_child):
+                                        shutil.rmtree(oldest_model_path_child)
+                                    # dir empty=> remove
+                                    if len(os.listdir(oldest_model_path_parent)) == 0:
+                                        os.rmdir(oldest_model_path_parent)
+                                    break
+               
+
+                #Set old_current_model to checked
+                if old_current_model is not None:
+                    old_current_model["status"] = "3_checked"
+                    old_current_folder= old_current_model['name'].split("_")[1]
+                    old_current_folder_name= old_current_model['name']
+                    old_current_model["path"]=os.path.join(MODEL_ROOT, 'checked',f"{old_current_folder}",f"{old_current_folder_name}",'weights','best.pt')
+                    model_list[f'{model}']['checked'].append(old_current_model)
+
+                
+                    os.makedirs(os.path.join(MODEL_ROOT, 'checked', f'{old_current_folder}'),exist_ok=True)
+                    shutil.move(os.path.join(MODEL_ROOT, 'current', f'{old_current_folder_name}'),
+                                os.path.join(MODEL_ROOT, 'checked', f'{old_current_folder}',f'{old_current_folder_name}'))
+                    
+                if len(model_list[f'{model}']['checked'])>0:
+                    #Set index of checked model
+                    list_checked_model=[int(mo['date_trained']) for mo in model_list[f'{model}']['checked']]
+                    list_checked_model.sort(reverse=True)
+                    for mo in model_list[f'{model}']['checked']:
+                        mo['status'] =f"2_checked_{list_checked_model.index(int(mo['date_trained']))+1}"
+                break
+        #Dump to json file
+        with open('/var/www/html/aiimg_execute/model/model_manager.json', 'w+', encoding='utf-8') as f:
+            json.dump(model_list, f)
+
+      
+        return "CHECK OK"
+    
+    #CHANGE TO CURRENT MODE
+    if mode=='change_to_current':
+        with open('/var/www/html/aiimg_execute/model/model_manager.json', 'r+', encoding='utf-8') as f:
+            model_list = json.load(f)
+
+        for model_ in model_list[f'{model}']['checked']:
+            if model_['name'] == name:
+
+                # save old current model 
+                old_current_model=  model_list[f'{model}']['current'][0]
+              
+                
+                to_current_model= model_
+                model_list[f'{model}']['checked'].remove(model_)
+
+                # move current model to checked 
+                model_list[f'{model}']['checked'].append(old_current_model)
+
+                # local directory
+                old_folder_name= old_current_model['name'].split("_")[1]
+                os.makedirs(os.path.join(MODEL_ROOT, 'checked', f'{old_folder_name}'),exist_ok=True)
+                shutil.move(os.path.join(MODEL_ROOT, 'current', f'{old_current_model["name"]}'),
+                            os.path.join(MODEL_ROOT, 'checked', f'{old_folder_name}',f'{old_current_model["name"]}'))
+
+               
+                # Set new checked model to current
+                to_current_model['status'] = '1_current'
+                model_list[f'{model}']['current']=[to_current_model]
+
+                #Move checked to current in local directory
+                if os.path.isdir(os.path.join(MODEL_ROOT, 'checked', f'{folder_name}', f'{name}')):
+                    shutil.move(os.path.join(MODEL_ROOT, 'checked', f'{folder_name}', f'{name}'),os.path.join(MODEL_ROOT, 'current', f'{name}'))
+                    
+                # dir empty=> remove
+                if len(os.listdir(os.path.join(MODEL_ROOT, 'checked', f'{folder_name}'))) == 0:
+                    os.rmdir(os.path.join(MODEL_ROOT, 'checked', f'{folder_name}'))
+
+                # Add old_current_model to checked
+                # json
+                list_checked_model=[int(mo['date_trained']) for mo in model_list[f'{model}']['checked']]
+                list_checked_model.sort(reverse=True)
+
+                for mo in model_list[f'{model}']['checked']:
+                    mo['status'] =f"2_checked_{list_checked_model.index(int(mo['date_trained']))+1}"
+                model_list[f'{model}']['checked']=sorted(model_list[f'{model}']['checked'], key=lambda x:x['status'],reverse=True)
+                   
+                break
+        #Dump to json file
+        with open('/var/www/html/aiimg_execute/model/model_manager.json', 'w+', encoding='utf-8') as f:
+            json.dump(model_list, f)
+
+        return "CHANGE OK"
+
+    
+    # TODO CHECK_NG mode
+    return "None"
+  
