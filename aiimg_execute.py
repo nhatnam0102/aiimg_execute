@@ -4,11 +4,18 @@ import shutil
 import base64
 import os
 import json
+import uuid
 import io
 from datetime import datetime
 import numpy as np
-from upc.common import general, common
+from upc.common import general
+
+from urllib.parse import quote_plus, urlparse
+
+
+import albumentations as A
 import subprocess
+import threading
 import requests
 from operator import itemgetter
 from celery import Celery
@@ -20,7 +27,36 @@ from PIL import Image
 from os.path import join, basename,isfile,isdir
 from datetime import timedelta
 
+from pymongo import MongoClient
+from pymongo.errors import OperationFailure
+from bson import DBRef,ObjectId
+
 app = Flask(__name__)
+
+username = "aiimg"
+password = "Kr3H4q=h_xn(D{ObdzFv"
+escaped_username = quote_plus(username)
+escaped_password = quote_plus(password)
+
+
+# Connect to the MongoDB server running at the specified IP and port
+client = MongoClient(f"mongodb://{escaped_username}:{escaped_password}@aiimg01.upc.co.jp:27017/?authSource=admin")
+# client = MongoClient("mongodb://192.168.0.111:27017/")
+
+# Access the "aiimg" database
+db = client['aiimg_104']
+
+# Access different collections within the "aiimg" database
+users_coll = db["users"]               # Collection for user data
+products_coll = db["products"]         # Collection for product data
+jobs_coll = db["jobs"]                 # Collection for job data
+dataset_coll = db["datasets"]           # Collection for dataset data
+actual_im_coll = db["actual_images"]   # Collection for actual images
+keys_coll = db["keys"]                 # Collection for keys
+models_coll = db["models"]               # Collection for model
+
+
+
 app.config.update(
     CELERY_BROKER_URL='redis://localhost:6379/0',
     CELERY_RESULT_BACKEND='redis://localhost:6379/0',
@@ -33,152 +69,365 @@ worker_process = None
 redis = Redis()
 # region Init
 ROOT = r"/var/www/html/aiimg_execute"
-DATA_ROOT = r"/var/www/html/aiimg_execute/web_dataset/Tokyo"
-MODEL_ROOT = r"/var/www/html/aiimg_execute/model"
-
-TOP_DATASET_P = join(DATA_ROOT, 'top')
-SIDE_DATASET_P = join(DATA_ROOT, 'side')
-SECOND_DATASET_P = join(DATA_ROOT, 'second_side')
-
-TEST_TOP_P = join(DATA_ROOT, 'test', 'top')
-TEST_SIDE_P = join(DATA_ROOT, 'test', 'side')
-TEST_SECOND_SIDE_P = join(DATA_ROOT, 'test', 'second_side')
+ROOT1 = r"/var/www/html/aiimg_execute/Data"
 
 BG_P_TOP = join(ROOT, "upc", "data", 'background', 'top_bg')
 BG_P_SIDE = join(ROOT, "upc", "data", 'background', 'side_bg')
 
-MAIN_P = [TOP_DATASET_P, SIDE_DATASET_P, SECOND_DATASET_P]
-TEST_P = [TEST_TOP_P, TEST_SIDE_P, TEST_SECOND_SIDE_P]
-REGISTERING_STATE='registering'
-REMOVING_STATE='removing'
+REGISTER_INTRAIN_STATE='register-intrain'
+REMOVING_STATE='remove-intrain'
 MODEL_LIST=['top','side','second_top','second_side']
 DEACTIVATED_STATE='deactivated'
 ACTIVATE_STATE='activate'
 
-# API_URL = 'https://ucloud.upc.co.jp/aiimg/api'
-API_URL = 'http://192.168.11.43:5000/aiimg/api'
-
 # endregion
 
+def get_dbref(user_,key):
+    user = users_coll.find_one({"username": user_})
+    if user:
+        db_ref = user[key]
+        return db_ref
+    else:
+        return None
 
-@celery.task
-def process_request(jobs):
-    # Set folder save model by job name
-    model_name= None
-    try:
-        save_to = jobs['jobs_name']
-        url = join(API_URL, 'update_jobs_status')
 
-        now = datetime.now().strftime('%Y%m%d%H%M%S')
-        print("GET DATA FROM lIST PRODUCT TO AUTO CREATE ANNOTATION ")
-        data_ = get_data_from_api(URL=join(API_URL, 'get_product_manager'))
-        print("GET DATA OK --->  CREATE IMAGES WITH AUTO ANNOTATION")
-        create_data_remove(data_, date_=now)
+def get_user_id(username):
+    # Retrieve the user document based on the current user's username if they are authenticated; otherwise, set to None.
+    # 現在のユーザーが認証されている場合、ユーザー文書を現在のユーザーのユーザー名を基に取得します。認証されていない場合、Noneに設定されます。
+    user_ = users_coll.find_one({"username": username})
+    return user_["_id"] if user_ else None
+
+def get_user_name(user_id):
+    user_ = users_coll.find_one({"_id":user_id})
+    return user_["username"] if user_ else None
+
+
+def remove_model_from_physical_drive(username,model_filter,category):
+    model_doc= models_coll.find_one(model_filter)
+  
+    if model_doc:
+        model_dir=join(ROOT1,username,category,'Model', 'base', f"{model_doc['name']}")
+        shutil.rmtree(model_dir) if isdir(model_dir) else None
+
+def remove_dataset_from_physical_drive(username,dataset_filter,category):
+    cursor=dataset_coll.find(dataset_filter)
+    remove_images=list(cursor)
+    for im in remove_images:
+        im_path=join(ROOT1,username,category,'Dataset', u_path(im['image_path']))
+        lb_path=join(ROOT1,username,category,'Dataset', u_path(im['label_path']))
+        os.remove(im_path) if isfile(im_path) else None
+        os.remove(lb_path) if isfile(lb_path) else None
+
+
+def reverse_removed_images(username,model,category):
+
+       # Find classes with 'status.uncheck' set to 'REMOVING_STATE'
+        # 'status.uncheck' が 'REMOVING_STATE' に設定されたクラスを検索します
+        cursor = products_coll.find({'user_id': get_user_id(username),
+                                     'category': category,
+                                    'model_direction': model,
+                                    'status.uncheck': REMOVING_STATE},
+                                    {'_id': 0, 'class_id': 1})
+        removing_cls_ids = list(cursor)
+        removing_cls_ids = [int(cls['class_id']) for cls in removing_cls_ids]
+
+      
+
+        # Update the status of selected annotations and update mod_date
+        # 選択した注釈のステータスを更新し、mod_dateを更新します
+        dataset_coll.update_many({'user_id': get_user_id(username),
+                                'annotation.class_id': {'$in': removing_cls_ids},
+                                'category': category,
+                                'model_direction': model},
+                                {'$set': {'annotation.$[ano].status': ACTIVATE_STATE,
+                                         
+                                          'mod_date': datetime.now().strftime('%Y%m%d%H%M%S'),
+                                           'status.uncheck':"registered"}},
+                                array_filters=[{'ano.class_id': {'$in': removing_cls_ids}}])
+
+        # Find reverse_images based on criteria
+        # 基準に基づいてreverse_imagesを検索します
+
+        cursor = dataset_coll.find({'user_id': get_user_id(username),
+                                    'category': category,
+                                    'model_direction': model,
+                                    'annotation.class_id': {'$in': removing_cls_ids}})
+        reverse_images = list(cursor)
+
+        # Set the number of threads for image processing
+        # 画像処理のためのスレッド数を設定します
+        num_threads = 30  # You can set the number of threads here
+        # Calculate the number of threads based on the number of backup images
+        # バックアップイメージの数に基づいてスレッド数を計算します
+        num_threads = min(len(reverse_images), num_threads)
+
+        if num_threads > 0:
+            # Use ThreadPoolExecutor to process images in parallel
+            # 画像を並行して処理するためにThreadPoolExecutorを使用します
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                # Submit image processing tasks to the thread pool
+                # 画像処理タスクをスレッドプールに送信します
+                for im in reverse_images:
+                    executor.submit(reverse_from_backup, im, username,category)
         
-        # Update jobs status to running
-        print("::POST UPDATE JOB DATA --->")
-        data_json = {'status': 'running', 'jobs': jobs}
-        response = requests.post(url, json=data_json)
-        print("::POST UPDATE JOB DATA >>>>>> OK ")
-        with open('/var/www/html/aiimg_execute/model/model_manager.json', 'r+', encoding='utf-8') as f:
-                        model_manager = json.load(f)
-        print("READ MODEL MANAGER --->")
-        # loop task in job and run task by task
-        for task_ in jobs['task_in_jobs']:
-            if 0 == 0:
-                print(f"{task_['model'].upper()} TRAINING")
-                
+        dataset_coll.update_many({'user_id': get_user_id(username),
+                                   'category': category,
+                                   'model_direction': model,
+                                   "annotation.status": {"$all": [ACTIVATE_STATE]},
+                                    'annotation.class_id': {'$in': removing_cls_ids}},
+                                    {'$set': {
+                                            'backup_path': None,
+                                            'mod_date': datetime.now().strftime('%Y%m%d%H%M%S'),
+                                             'status.uncheck':"registered",
+                                    }})
 
-                task_['start_train_time'] = datetime.now().strftime('%Y%m%d%H%M%S')
+def remove_created_models(username,model,category):
+        # Define a model filter for deletion
+        # 削除のためのモデルフィルタを定義します
+        model_filter = {'model_direction': model,
+                        'category': category,
+                        'status': 'uncheck',
+                        'user_id': get_user_id(username)}
 
-                # call api update job status from AIIMG
+        # Remove the trained model from the physical drive if the job failed
+        # ジョブが失敗した場合、物理ドライブからトレーニング済みモデルを削除します
+        remove_model_from_physical_drive(username, model_filter,category)
 
-                data_json = {'status': 'update', 'jobs': jobs}
-                response = requests.post(url, json=data_json)
-                name = ""
-                #
-                if task_['type'] == 'new':
-                    cmd, pretrain_path,name = train(model=task_['model'], pretrain=False, save_to=save_to, epochs=1,time_=0)
-                    model_name=name
-                    process = subprocess.check_call(cmd, shell=True)
-                    cmd, pretrain_path, name= train(model=task_['model'],pretrain=True,pretrain_path=pretrain_path, save_to=save_to, epochs=1, time_=1)
-                    model_name=name
-                    process = subprocess.check_call(cmd, shell=True)
+        # Remove the model from the MongoDB collection
+        # MongoDBコレクションからモデルを削除します
+        models_coll.delete_one(model_filter)
 
-                else:
-                    pretrain_path="''"
-                    if len(model_manager[f"{task_['model']}"]) >0:
-                        for weight in model_manager[f"{task_['model']}"]:
-                            if weight['status']=='1_current':
-                                pretrain_path=join(MODEL_ROOT,'base',weight['name'],'weights','best.pt')
-                                break
-                    cmd, pretrain_path, name= train(model=task_['model'], pretrain=True,pretrain_path=pretrain_path, save_to=save_to, epochs=1)
-                    model_name=name
-                    process = subprocess.check_call(cmd, shell=True)
-                
-                # remove first model trained if task_['type'] == new
-                if os.path.isdir(join(MODEL_ROOT, 'base', f"{name[:-4]}_pre")):
-                    shutil.rmtree(join(MODEL_ROOT, 'base', f"{name[:-4]}_pre"))
+def remove_created_images(username,model,category):
+       # Define a filter for datasets created by 'auto'
+        # 'auto'によって作成されたデータセットのフィルタを定義します
+        create_by_auto_filter = {'user_id': get_user_id(username),
+                                'category': category,
+                                "status.old":None,
+                                'status.current':None,
+                                'status.uncheck':REGISTER_INTRAIN_STATE,
+                                'create_by': 'auto',
+                                'model_direction': model}
 
-                # if dir empty=> remove
+        # Remove the dataset from the physical drive
+        # 物理ドライブからデータセットを削除します
+        remove_dataset_from_physical_drive(username, create_by_auto_filter,category)
 
-                task_['end_train_time'] = datetime.now().strftime('%Y%m%d%H%M%S')
-                task_['status'] = 'OK'
-               
-                
-                path=fr"{name}\weights\best.pt"
-                uncheck_model = {
-                    "type": task_['model'],
-                    "name": f"{name}",
-                    "path": path,
-                    "date_registered": task_['start_train_time'],
-                    "date_trained": task_['end_train_time'],
-                    "mode": task_['mode'],
-                    "images_num": None,
-                    "model_size": 0,
-                    "status": "3_uncheck",
-                    "result": "--",
-                    "desc": {}
-                }
-                model_manager[f"{task_['model']}"].append(uncheck_model)
+        # Delete the dataset from the MongoDB collection
+        # MongoDBコレクションからデータセットを削除します
+        dataset_coll.delete_many(create_by_auto_filter)
 
-                with open('/var/www/html/aiimg_execute/model/model_manager.json', 'w+', encoding='utf-8') as f:
-                    json.dump(model_manager, f)
+        # Define a filter for datasets created by 'actual'
+        # 'actual'によって作成されたデータセットのフィルタを定義します
+        create_by_actual_filter = {'user_id': get_user_id(username),
+                                    'category': category,
+                                    "status.old":None,
+                                    'status.current':None,
+                                    'status.uncheck':REGISTER_INTRAIN_STATE,
+                                    'create_by': 'actual',
+                                    'model_direction': model}
 
-                # call api update job status from AIIMG
-                data_json = {'status': 'update', 'jobs': jobs}
-                response = requests.post(url, json=data_json)
-                print(f"{task_['model'].upper()} TRAINED")
+        # Remove the dataset from the physical drive
+        # 物理ドライブからデータセットを削除します
+        remove_dataset_from_physical_drive(username, create_by_actual_filter,category)
 
-        redis.set(jobs['jobs_id'], str(jobs))
-        # call api update job status from AIIMG
-        data_json = {'status': 'finished', 'jobs': jobs}
-        response = requests.post(url, json=data_json)
+        # Find and get the image names created by 'actual'
+        # 'actual'によって作成された画像名を検索および取得します
+        cursor = dataset_coll.find(create_by_actual_filter)
+        created_images_by_actual = [im['image_name'] for im in cursor]
+
+        # Update the status of images created by 'actual' in the actual_im_coll
+        # actual_im_coll内の 'actual'によって作成された画像のステータスを更新します
+        actual_im_coll.update_many(
+            {
+                "user_id": get_user_id(username),
+                "image_name": {'$in': created_images_by_actual},
+            },
+            {"$set": {"status": "added"}},
+        )
+
+        # Delete the dataset from the MongoDB collection
+        # MongoDBコレクションからデータセットを削除します
+        dataset_coll.delete_many(create_by_actual_filter)
+
+def reverse_data(username,task,model, category):
+    # Update the job status to 'failed' in the jobs collection
+    # ジョブのステータスを 'failed' に更新する（jobsコレクション内）
+    jobs_coll.update_one({'_id': task['_id']},
+                        {
+                            '$set': {'status': 'failed'},
+                        })
+
+    # Loop through the execute_model_list
+    # execute_model_listをループします
+    reverse_removed_images(username,model,category)
+    remove_created_models(username,model,category)
+    remove_created_images(username,model,category)
+
+
+def init_uncheck_model(task,name,path):
+      uncheck_model = {
+                        "model_direction": task['model_direction'],
+                        "name": f"{name}",
+                        "path": path,
+                        "reg_date": task['start_at'],
+                        "trained_date": task['end_at'],
+                        "release_date": None,
+                        "mode": task['mode'],
+                        "images_num": None,
+                        "model_size": 0,
+                        "status": "uncheck",
+                        "result": "--",
+                        "desc": {},
+                        "category":task['category'],
+                        "user_id":task['user_id'],
+
+                        }
+      return uncheck_model
+@celery.task
+def process_request(data):
+    task_id=ObjectId(data['task_id'])
+    task_filter={'_id':task_id}
+    task_=jobs_coll.find_one(task_filter)
+  
+    try:
+        print("Initiating")
+        username=get_user_name(task_['user_id'])
+        category=task_['category']
+        save_to = task_['name']
+        model=task_['model_direction']
+        
+        print("Create data remove")
+        create_data_remove(username,category,save_to,model)
+        print("Create data remove OK")
+
+        jobs_coll.update_one({'_id':task_id},{'$set':{'status':'running'},})
+        print(f"{model.upper()} TRAINING")
+        jobs_coll.update_one(task_filter,{'$set':{'start_at':datetime.now().strftime('%Y%m%d%H%M%S')}})
+        name = ""
+        # raise Exception("test")
+        #
+        if task_['type'] == 'new':
+            print("0")
+            cmd, pretrain_path,name = train(username,category,model=model, pretrain=False, save_to=save_to, epochs=int(task_['epoch']),time_=0)
+            
+            process = subprocess.check_call(cmd, shell=True)
+
+            cmd, pretrain_path, name= train(username,category,model=model,pretrain=True,pretrain_path=pretrain_path, save_to=save_to, epochs=int(task_['epoch']), time_=1)
+
+            process = subprocess.check_call(cmd, shell=True)
+
+        else:
+            pretrain_path="''"
+            if task_['for_model']=='uncheck': 
+                print("1")
+                models_doc = models_coll.find_one({'user_id':get_user_id(username),
+                                                'model_direction':task_['model_direction'],
+                                                'category':category,
+                                                'status':'uncheck'},
+                                                {'_id':0,'name':1}) 
+                print(models_doc)
+                pretrain_path=join(ROOT1,username,category,'Model','base',models_doc['name'],'weights','best.pt')
+            elif task_['for_model']=='current':
+                    models_doc = models_coll.find_one({'user_id':get_user_id(username),
+                                                'model_direction':task_['model_direction'],
+                                                'category':category,
+                                                'status':'current'},
+                                                {'_id':0,'name':1}) 
+                    pretrain_path=join(ROOT1,username,category,'Model','base',models_doc['name'],'weights','best.pt')
+        
+        
+            cmd, pretrain_path, name= train(username,category,model=model, pretrain=True,pretrain_path=pretrain_path, save_to=save_to, epochs=int(task_['epoch']))
+            process = subprocess.check_call(cmd, shell=True)
+    
+        # remove first model trained if task_['type'] == new
+        if os.path.isdir(join(ROOT1,username,category,'Model', 'base', f"{name[:-4]}_pre")):
+            shutil.rmtree(join(ROOT1,username,category,'Model', 'base', f"{name[:-4]}_pre"))
+
+        # if dir empty=> remove
+        print("Calculating images count")
+        cursor = products_coll.find(
+            {"user_id":get_user_id(username),'category':category, "model_direction": model}, {"_id": 0}
+        )
+        products_doc = list(cursor)
+        for product in products_doc:
+            cursor = list(dataset_coll.find(
+            {
+                "user_id": get_user_id(username),
+                "model_direction": model ,
+                'category':category,
+                "annotation.class_id": product['class_id'],
+            }))
+            im_count=len(cursor)
+
+            products_coll.update_one({"user_id": get_user_id(username),
+                "model_direction": model ,
+                'category':category,
+                "class_id": product['class_id']},
+                {'$set':{'images_count':im_count}})
+        
+        print("Update task status")
+        jobs_coll.update_one(task_filter,
+                            {
+                            '$set':{'end_at': datetime.now().strftime('%Y%m%d%H%M%S'),
+                                    'status':'finished'}
+                            })
+        path=fr"{name}\weights\best.pt"
+        
+        #Updated
+        task_=jobs_coll.find_one(task_filter)
+
+        uncheck_model =init_uncheck_model(task_,name,path)
+        
+        models_coll.delete_one(
+                        {"user_id":get_user_id(username),
+                        'category':category,
+                        'model_direction':model,
+                        'status':'uncheck'
+                            })
+        models_coll.insert_one(uncheck_model)
+        print(f"{model.upper()} TRAINED")
+       
+        return 'TASK FINISH'
 
     except Exception as e:
 
         print(f"TRAIN ERROR : {e}")
-        if model_name and  os.path.isdir(model_name):
-            shutil.rmtree(
-                    join(MODEL_ROOT, 'base',
-                                f'{model_name}'))
-        data_json = {'status': 'failed', 'jobs': jobs}
-        response = requests.post(url, json=data_json)
-    return 'TASK FINISH'
+        reverse_data(username,task_,model, category)
+        reverse_status(model,username,category)
 
-def train(model='', save_to="", pretrain=None,pretrain_path="''", epochs=150, batch_size=32, time_=None):
 
-   
+def reverse_status(model,username,category):  
+    products_coll.update_many(
+            {
+                "user_id": get_user_id(username),
+                "model_direction": model,
+                "category": category,
+                "status.uncheck": REGISTER_INTRAIN_STATE,
+            },
+            {'$set':{"status.uncheck": "registering"}}
+        )
+    products_coll.update_many(
+            {
+                "user_id": get_user_id(username),
+                "model_direction": model,
+                "category": category,
+                "status.uncheck": "remove-intrain",
+            },
+             {'$set':{"status.uncheck": "removing"}}
+        )
 
-    train_path = "/home/upc/WorkSpaces/nam/yolov5/train.py"
-    batch_size = 16 if model in['top','side'] else 8
+def train(user,category,model='', save_to="", pretrain=None,pretrain_path="''", epochs=150, batch_size=32, time_=None,):
 
-    data_yaml_path = join(DATA_ROOT, f"{model}_dataset/custom_dataset.yaml")
 
-    config_yaml_path = join(DATA_ROOT, f"{model}_dataset/custom_model.yaml")
+    train_path = "/home/upc/nam/yolov5/train.py"
+    batch_size = 32 if model in['top','side'] else 16
+
+    data_yaml_path = join(ROOT1,user,category,'Dataset', f"{model}_dataset/custom_dataset.yaml")
+
+    config_yaml_path = join(ROOT1,user,category,'Dataset', f"{model}_dataset/custom_model.yaml")
     model_id = '01' if model == 'top' else '02' if model == 'side' else '03'
 
-    save_path = join(MODEL_ROOT, "base")
+    save_path = join(ROOT1,user,category,'Model', "base")
 
 
     if pretrain:   
@@ -232,12 +481,15 @@ def clear():
     return "OK"
 
 
-@app.route('/ubuntu_api/add_train_jobs', methods=['POST'])
-def add_train_task():
+@app.route('/api/add_train_task', methods=['POST'])
+def add_train_jobs():
     if request.method == 'POST':
-        jobs = request.get_json()
-        process_request.apply_async(kwargs={'jobs': jobs}, task_id=jobs['jobs_id'])
-        return "Add ok"
+        data = request.get_json()
+        process_request.apply_async(kwargs={'data': data})
+        return "add ok"
+   
+   
+   
 
 
 @app.route('/ubuntu_api/cancel_task', methods=['POST'])
@@ -257,28 +509,6 @@ def get_result():
         value.append(rss)
 
     return jsonify({'rs': value})
-
-
-@app.route('/ubuntu_api/converse', methods=["GET"])
-def converse():
-   side_, _ = general.get_all_file(join(DATA_ROOT, 'second_side_jpg'))
-   converse2jpg(side_)
-   return "OK"
-
-
-@app.route('/ubuntu_api/auto_anno', methods=["GET"])
-def auto_anno():
-    data_ = get_data_from_api(URL=join(API_URL, 'get_product_manager'))
-    print("GET DATA OK --->  CREATE IMAGES WITH AUTO ANNOTATION")
-    create_data_remove(data_, date_=datetime.now().strftime('%Y%m%d%H%M%S'))
-   
-    return "OK"
-
-@app.route('/ubuntu_api/auto_create_dataset', methods=["GET"])
-def auto_create_dataset():
-    for model in ['top','side','second_side']:
-        create_dataset(join(DATA_ROOT,f'{model}_dataset','auto'),join(DATA_ROOT,f'{model}_dataset','uncheck'),without_valid=True)
-    return "OK"
 
 
 # region process
@@ -332,269 +562,191 @@ def base642PIL(base64_str):
 
 def u_path(path):
     return path.replace("\\", "/")
-
-def remove_image(removing_products,model=None):
-    print('DO REMOVE')
-    with open(join(DATA_ROOT,f'{model}_dataset',f'{model}_dataset.json'),'r',encoding='utf-8') as f:
-        dataset=json.load(f)
-
-    backup_json=[]
-    bk_path= join(DATA_ROOT,f"{model}_dataset","backup")
-    os.makedirs(bk_path,exist_ok=True)
-    print('DO REMOVE1')
-    try:
-        with open(join(bk_path,'backup.json'),'r+',encoding='utf-8') as f:
-            backup_json=json.load(f)
-    except IOError:
-        pass
-    rm_products=[]
-    print('DO REMOVE2')
-    for product in removing_products:
-        for design in product['design']:
-            if design['status']['uncheck']==REMOVING_STATE:
-                rm_id=int(product['class_id'])
-                rm_ds=int(design['design_id'])
-                if len(rm_products)>0:
-                    for rm_ in rm_products:
-                        if rm_id == int(rm_['rm_id']) and rm_ds not in rm_['rm_ds'] :
-                            rm_['rm_ds'].append(rm_ds)
-                        else:
-                            rm_products.append({
-                                'rm_id':int(rm_id),
-                                'rm_ds':[rm_ds]
-                            })
-                        break
-                else:
-                    rm_products.append({
-                        'rm_id':int(rm_id),
-                        'rm_ds':[rm_ds]
-                    })
-                    
-
-
-    #backup
     
-    print('DO BK')
-   
-    bk_images=[] 
-
-   # mode is train or  valid 
-    for image in dataset:
-        for annotation in image['annotation']:
-            if int(annotation['class_id']) in [rm_['rm_id'] for rm_ in rm_products]:
-                print(annotation['class_id'])
-                for rm in rm_products:
-                    if int(rm['rm_id']) == int(annotation['class_id']):
-                        for box in annotation['boxes']:
-                            if int(box['design']) in rm['rm_ds']:
-                                    image['modifi_date']=datetime.now().strftime('%Y%m%d%H%M%S')
-                                    box['status']=DEACTIVATED_STATE
-                    # Change status of [id] to deactivated if all [design] has been deactivated
-                        status_state=[box['status'] for box in annotation['boxes']]
-                        if ACTIVATE_STATE not in status_state:
-                            annotation['status']=DEACTIVATED_STATE
-                            image['modifi_date']=datetime.now().strftime('%Y%m%d%H%M%S')
-                        bk_images.append(image)
-                        ###########
-
-                        #backup
-                        # check exist backup
-                        
-                        new_backup_path=join(bk_path,image['image_name'])
-                        new_back_path_to_save=fr"{model}_dataset\backup\{basename(new_backup_path)}"
-                        if u_path(image['image_path']) is not None and u_path(image['image_path'])==new_back_path_to_save and isfile(new_backup_path):
-                            break
-                        else:
-                            shutil.copy(join(DATA_ROOT,u_path(image['image_path'])),new_backup_path)
-                            image['backup_path']=new_back_path_to_save
-                            break
-                
-    print('DO BK2')
-    for rm_image in bk_images:
-        if ACTIVATE_STATE not in [ anno['status'] for anno in rm_image['annotation']]:
-            if isfile(join(DATA_ROOT,u_path(rm_image['image_path']))):
-                os.remove(join(DATA_ROOT,u_path(rm_image['image_path'])))
-            if isfile(join(DATA_ROOT,u_path(rm_image['label_path']))):
-                os.remove(join(DATA_ROOT,u_path(rm_image['label_path'])))
+def process_image(im,username,category):
+        if ACTIVATE_STATE not in [anno['status'] for anno in im['annotation']]:
+            if isfile(join(ROOT1,username, category, 'Dataset', u_path(im['image_path']))) and isfile(join(ROOT1,username,category, 'Dataset', u_path(im['label_path']))):
+                os.remove(join(ROOT1,username,category, 'Dataset', u_path(im['image_path'])))
+                os.remove(join(ROOT1,username,category, 'Dataset', u_path(im['label_path'])))
         else:
-            #Read Opencv image
-            image=cv2.imread(join(DATA_ROOT,u_path(rm_image['image_path'])),cv2.IMREAD_UNCHANGED)
-            with open(join(DATA_ROOT,u_path(rm_image['label_path'])),'w+',encoding='utf-8') as f:
-                for annotation in rm_image['annotation']:
-                    # Check if id not is a rm_id and status is active
-                    # rewrite it to label
-                    if int(annotation['class_id']) not in [rm['rm_id'] for rm in rm_products] and annotation['status'] == ACTIVATE_STATE:
-
-                        for box in annotation['boxes']:
-                            if box['status']==ACTIVATE_STATE:
-                                line_= f"{annotation['class_id']} {box['x_center']} {box['y_center']} {box['width']} {box['height']}"
+            # Read OpenCV image
+            image = cv2.imread(join(ROOT1,username,category, 'Dataset', u_path(im['image_path'])), cv2.IMREAD_UNCHANGED)
+            with open(join(ROOT1,username,category, 'Dataset', u_path(im['label_path'])), 'w+', encoding='utf-8') as f:
+                for cls_id in im['annotation']:
+                    if cls_id["status"] == ACTIVATE_STATE:
+                        for box in cls_id['boxes']:
+                                line_ = f"{cls_id['class_id']} {box['x_center']} {box['y_center']} {box['width']} {box['height']}"
                                 f.write(line_)
                                 f.write('\n')
-                    if int(annotation['class_id']) in [rm['rm_id'] for rm in rm_products]:
-                        # if id in remove id , and status is deactivate
-                        if annotation['status']==DEACTIVATED_STATE:
-                            #replace image in box by white box
-                            for box in annotation['boxes']:
-                                print('DO BK2 2')
-                                box_=[box['x_center'],box['y_center'],box['width'],box['height']]
-                                x,y,w,h=general.yolo_box_to_rec_box(box_,image.shape[:2])
-                                cv2.rectangle(image,(x,y),(x+w,y+h),(255,255,255),-1)
+                    if cls_id['status'] == DEACTIVATED_STATE:
+                        for box in cls_id['boxes']:
+                            box_ = [box['x_center'], box['y_center'], box['width'], box['height']]
+                            x, y, w, h = general.yolo_box_to_rec_box(box_, image.shape[:2])
+                            cv2.rectangle(image, (x, y), (x + w, y + h), (255, 255, 255), -1)
 
-                            
-                        if annotation['status']==ACTIVATE_STATE:
-                            for box in annotation['boxes']:
-                                print('DO BK2 3')
-                                if box['status']==ACTIVATE_STATE:
-                                    line_= f"{annotation['class_id']} {box['x_center']} {box['y_center']} {box['width']} {box['height']}"
+            cv2.imwrite(join(ROOT1,username,category, 'Dataset', u_path(im['image_path'])), image)
+
+def reverse_from_backup(im,username,category):
+            if im['backup_path'] and  isfile(join(ROOT1,username,category, 'Dataset', u_path(im['backup_path']))):
+                image = cv2.imread(join(ROOT1,username,category, 'Dataset', u_path(im['backup_path'])), cv2.IMREAD_UNCHANGED)
+                with open(join(ROOT1,username,category, 'Dataset', u_path(im['label_path'])), 'w+', encoding='utf-8') as f:
+                    for cls_id in im['annotation']:
+                        if cls_id["status"] == ACTIVATE_STATE:
+                            for box in cls_id['boxes']:
+                                    line_ = f"{cls_id['class_id']} {box['x_center']} {box['y_center']} {box['width']} {box['height']}"
                                     f.write(line_)
                                     f.write('\n')
-                                if box['status']==DEACTIVATED_STATE:
-                                    box_=[box['x_center'],box['y_center'],box['width'],box['height']]
-                                    x,y,w,h=general.yolo_box_to_rec_box(box_,image.shape[:2])
-                                    cv2.rectangle(image,(x,y),(x+w,y+h),(255,255,255),-1)
-            
+                        if cls_id['status'] == DEACTIVATED_STATE:
+                            for box in cls_id['boxes']:
+                                box_ = [box['x_center'], box['y_center'], box['width'], box['height']]
+                                x, y, w, h = general.yolo_box_to_rec_box(box_, image.shape[:2])
+                                cv2.rectangle(image, (x, y), (x + w, y + h), (255, 255, 255), -1)
 
-            cv2.imwrite(join(DATA_ROOT,u_path(rm_image['image_path'])),image)
-        
-    print('DO BK3')
-    list_im=[bk['image_name'] for bk in bk_images]
-    if len(backup_json)>0:
-        for backup in backup_json[:]:
-            if backup['image_name'] in list_im:
-                backup_json.remove(backup)
-    backup_json.extend(bk_images)
-        
-    with open(join(bk_path,'backup.json'),'w+',encoding='utf-8') as f:
-          json.dump(backup_json,f)
+                cv2.imwrite(join(ROOT1,username,category, 'Dataset', u_path(im['image_path'])), image)
+                if DEACTIVATED_STATE not in [anno['status'] for anno in im['annotation']]:
+                    os.remove(join(ROOT1,username,category, 'Dataset', u_path(im['backup_path'])))
 
-    for image in dataset[:]:
-        status_state=[ano['status'] for ano in image['annotation']]
-        if ACTIVATE_STATE not in status_state:
-            dataset.remove(image)
 
-    with open(join(DATA_ROOT,f'{model}_dataset',f'{model}_dataset.json'),'w',encoding='utf-8') as f:
-        json.dump(dataset,f)
+
+
+from concurrent.futures import ThreadPoolExecutor
+
+def backup_remove(removing_cls_ids, model,username,category):
+    bk_path= join(ROOT1,username,category,'Dataset',f"{model}_dataset","backup")
+    os.makedirs(bk_path,exist_ok=True)
+
+    dataset_coll.update_many({'user_id':get_user_id(username),
+                            'annotation.class_id':{'$in':removing_cls_ids},
+                            'category':category,
+                            'model_direction':model},
+                            {'$set':{'annotation.$[ano].status':DEACTIVATED_STATE}},
+                            array_filters=[{'ano.class_id':{'$in':removing_cls_ids}}])
     
-
-    print('REMOVE BOX IN IMAGES') 
+    dataset_coll.update_many({'user_id':get_user_id(username),
+                            'annotation.class_id':{'$in':removing_cls_ids},
+                            'category':category,
+                            'model_direction':model,
+                            "annotation.status": DEACTIVATED_STATE,
+                            "annotation": {"$not": {"$elemMatch": {"status": ACTIVATE_STATE}}}},
+                            {'$set':{'status.uncheck':"removed"}})
     
+    cursor=dataset_coll.find({'user_id':get_user_id(username),
+                                'category':category,
+                               'model_direction':model,
+                              'annotation.class_id':{'$in':removing_cls_ids}})
+    bk_images=list(cursor)
+    
+    
+    for image in bk_images:
+        new_backup_path=join(bk_path,image['image_name'])
+        new_back_path_to_save=fr"{model}_dataset\backup\{basename(new_backup_path)}"
 
-def create_data_remove(data, date_=None):
+        # check exist backup
+        if u_path(image['image_path']) is not None and u_path(image['image_path'])==new_back_path_to_save and isfile(new_backup_path):
+            continue
+
+        else:
+            shutil.copy(join(ROOT1,username,category,'Dataset',u_path(image['image_path'])),new_backup_path)
+            dataset_coll.update_one({'user_id':get_user_id(username),
+                                    'category':category,
+                                    'model_direction':model,
+                                    'image_name':image['image_name']},
+                                    {'$set':{'backup_path':new_back_path_to_save}})
+
+    # Process images concurrently using threading
+    num_threads = 30  # You can set the number of threads here
+    # Calculate the number of threads based on the number of backup images
+    num_threads = min(len(bk_images), num_threads)
+
+    if num_threads > 0:
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            # Submit image processing tasks to the thread pool
+            for im in bk_images:
+                executor.submit(process_image, im,username,category)
+
+    print(f'REMOVE BOX IN IMAGES FROM {model}')
+
+def create_actual_image(username,model,category):
+    cursor=actual_im_coll.find({'username': username,
+                                'model_direction':model,
+                                'category':category,
+                                'status':'added'})
+    actual_images=list(cursor)
+    insert_images=[]
+
+
+    for image in actual_images:
+        im = Image.open(io.BytesIO( base64.b64decode(image['image_base64']))).convert("RGB")
+    
+        im_name=image['image_name']
+        im_txt=image['image_name'][:-4]+'.txt'
+
+        im.save(join(ROOT1,username,category,'Dataset',f'{model}_dataset','base','images','train',im_name))
+        
+        with open(join(ROOT1,username,category,'Dataset',f'{model}_dataset','base','labels','train',im_txt),'w+',encoding='utf-8') as f:
+    
+            for anno in image['annotation']:
+                    if anno['status'] == ACTIVATE_STATE:
+                        for box in anno['boxes']:
+                                line_= f"{anno['class_id']} {box['x_center']} {box['y_center']} {box['width']} {box['height']}"
+                                f.write(line_)
+                                f.write('\n')
+
+        image_={ "image_name":im_name,
+                "image_path":fr"{model}_dataset\base\images\train\{im_name}",
+                "label_path":fr"{model}_dataset\base\labels\train\{im_txt}",
+                "backup_path": None,
+                "status":{"old":None,
+                          'current':None,
+                          'uncheck':"registered"},
+                "create_by": "actual",
+                "reg_date":datetime.now().strftime("%Y%m%d%H%M%S"),
+                "mod_date":datetime.now().strftime("%Y%m%d%H%M%S"),
+                "annotation":image['annotation'],
+                'model_direction':model,
+                "user_id":get_user_id(username),
+                "category":category }
+        insert_images.append(image_)
+    
+    if len(actual_images)>0:
+        actual_im_coll.update_many({'username': username,
+                                    'model_direction':model,
+                                    "category":category,
+                                    'image_name': {'$in':[im['image_name'] for im in actual_images]}},
+                                    {'$set':{'status':REGISTER_INTRAIN_STATE}})
+    
+    if len(insert_images) > 0:
+        dataset_coll.insert_many(insert_images)
+
+def create_data_remove(username,category,save_to,model):
+ 
     # TODO  run with product type
     # Add mode for single case pack, feature
     print('START CREATE DATA REMOVE') 
-    registing_products={
-        "top":[],
-        "side":[],
-        "second_top":[],
-        "second_side":[] 
-        }
-    removing_products={
-        "top":[],
-        "side":[],
-        "second_top":[],
-        "second_side":[] 
-        }
-    
-    for model in MODEL_LIST:
-        for product in data[f'{model}']:
-            for design in product['design']:
-                if design['images'] is None or len(design['images']) == 0:
-                    continue
-                if design['status']['uncheck'] == REGISTERING_STATE:
-                   registing_products[f'{model}'].append(product)
+    create_actual_image(username,model,category)
+    cursor=products_coll.find({'user_id': get_user_id(username),
+                               "category": category,
+                                'model_direction':model,
+                                'status.uncheck':REGISTER_INTRAIN_STATE})
+    registing_products=list(cursor)
 
-                if design['status']['uncheck'] == REMOVING_STATE:
-                    removing_products[f'{model}'].append(product)
-                     
-    print('REMOVE OK') 
-    for model in MODEL_LIST:
-        if len(removing_products[f'{model}'])>0:
-            remove_image(removing_products[f'{model}'],model=f'{model}') 
-
-        if len(registing_products[f'{model}'])>0:
-               resize_and_merge(registing_products[f'{model}'], join(DATA_ROOT,f'{model}_dataset','auto'), model=f'{model}', im_num=10, date_=date_)
-               print('CREATE AUTO IMAGE OK') 
-               create_dataset(join(DATA_ROOT,f'{model}_dataset','auto'),join(DATA_ROOT,f'{model}_dataset','base'),without_valid=True)
-               print('CREATE AUTO DATASET OK') 
-               create_dataset_manager(model=model,mode='auto')
-               print('CREATE AUTO DATASET OK 2')        
-       
-def create_dataset_manager(model,mode=None):
-        with open(join(DATA_ROOT,f'{model}_dataset',f'{model}_dataset.json'),'r',encoding='utf-8') as f:
-            dataset_manager=json.load(f)
-        path_= join(DATA_ROOT,f'{model}_dataset','base')
-        list_images=[image['image_name'] for image in dataset_manager]
-        all_files,_= general.get_all_file(path_)
-        for f in all_files:
-            if basename(f) not in list_images:
-               
-                image={
-                    "image_name":basename(f)
-                }
-                if f.endswith('png') or f.endswith('jpg'):
-                    type_='train' if 'train' in f else 'valid'
-                    image_path_to_save=fr"{model}_dataset\base\images\{type_}\{basename(f)}"
-                    image['image_path']=image_path_to_save
-
-                    label_path_to_save=image_path_to_save.replace('images','labels')
-                    label_path_to_save=label_path_to_save[:-4]+'.txt'
-                    image['label_path']=label_path_to_save
-                    image['backup_path']=None
-                    image['dependent_by']='uncheck'
-                    image['create_by']=mode
-                    image['regist_date']=datetime.now().strftime("%Y%m%d%H%M%S")
-                    image['modifi_date']=datetime.now().strftime("%Y%m%d%H%M%S")
-                    image['annotation']=[]
-
-                    label_path=f.replace('images','labels')
-                    label_path=label_path[:-4]+'.txt'
-                    if isfile(label_path):
-                        with open(label_path, 'r') as f:
-                            lines=[line.rstrip() for line in f.readlines()]
-                        for line in lines:
-                            liness_=line.split(' ')
-                            class_id_list=[anno['class_id'] for anno in image['annotation']]
-                            if int(liness_[0]) in class_id_list:
-                                for anoo in image['annotation']:
-                                    if int(anoo['class_id']) == int(liness_[0]):
-                                        position={
-                                            "x_center":float(liness_[1]),
-                                                "y_center":float(liness_[2]),
-                                                "width":float(liness_[3]),
-                                                "height":float(liness_[4]),
-                                                "design":0,
-                                                "status":"activate"
-                                        }
-                                        anoo['boxes'].append(position)
-                                
-                                        break
-                            else:
-                                anoo_box={
-                                        "class_id": int(liness_[0]),
-                                        "boxes":[{
-                                                "x_center":float(liness_[1]),
-                                                "y_center":float(liness_[2]),
-                                                "width":float(liness_[3]),
-                                                "height":float(liness_[4]),
-                                                "design":0,
-                                                "status":"activate"
-                                        }],
-                                        "status":"activate"
-                                        }
-                                image['annotation'].append(anoo_box)
+    cursor=products_coll.find({'user_id': get_user_id(username),
+                               'category':category,
+                                'model_direction':model,
+                                'status.uncheck':REMOVING_STATE},{'_id':0,'class_id':1})
+    removing_cls_ids=list(cursor)
+    removing_cls_ids=[int(cls['class_id']) for cls in removing_cls_ids]   
         
-                        dataset_manager.append(image)   
-        with open(join(DATA_ROOT,f'{model}_dataset',f'{model}_dataset.json'),'w',encoding='utf-8') as f:
-            json.dump(dataset_manager,f)
+    backup_remove(removing_cls_ids,model,username,category) 
+    resize_and_merge(username,category, registing_products,model, im_num=10)
+    print(f'CREATE AUTO IMAGE FOR {model.upper()} OK') 
 
-
-def resize_and_merge(registing_products, save_to, bg_p=None, model=None, im_num=5, date_=None):
+def resize_and_merge(username,category,registing_products, model=None, im_num=5):
     # For top side model
     if 'second' not in model: 
     # Get list of images be resized to
-        [min_size,max_size] = [0.9,1.1] if model=='top' else [0.7,1.2]
-        resized_images = common.resize(registing_products, min_size=min_size, max_size=max_size, step=0.1, im_num=im_num,DATA_ROOT=DATA_ROOT)
+        [min_size,max_size] = [0.9,1.1] if model=='top' else [0.7,1.3]
+        resized_images = resize(registing_products, min_size=min_size, max_size=max_size, step=0.1, im_num=im_num,DATA_ROOT=join(ROOT1,username,category,'Dataset'))
 
         bg_images_path, _ = general.get_all_file(join(ROOT, "upc", "data", 'background', f'{model}_bg'))
 
@@ -603,29 +755,73 @@ def resize_and_merge(registing_products, save_to, bg_p=None, model=None, im_num=
         bg_images = [Image.open(im_p).convert("RGBA") for im_p in bg_images_path]
 
         # Get merged list of images be resized
-        common.merge_thread(foregrounds=resized_images,
+        merge_thread(foregrounds=resized_images,
                             backgrounds=bg_images,
-                            p_save=save_to,
+                            model=model,
                             rotate_=359 if model == 'top' else 5,
                             rotate_step=10 if model == 'top' else 1,
                             cutout_=True,
-                            name=f"{date_}"
+                            DATA_TRANSFER={'DATA_ROOT':join(ROOT1,username,category,'Dataset'),
+                                           'username':username,
+                                           'category':category ,
+                                           'user_id':get_user_id(username)}
                             )
     else : # for second model 
         for product in registing_products:
-            for design in product['design']:
-                for idx,image_ in enumerate(design['images']):
-                    name = f"{product['class_id']}_{design['design_id']}-{str(idx)}"
+                for image_ in product['images']:
+                    name = uuid.uuid4()
+
                     image_path =image_['image_path'].replace('\\','/')
-                    im= Image.open(join(DATA_ROOT,image_path)).convert('RGB')
-                    im.save(join(save_to,name+'.jpg'))
-                    x, y, x1, y1 = image_['feature_position']['x_min'],image_['feature_position']['y_min'],image_['feature_position']['x_max'],image_['feature_position']['y_max']
-                    h,w=image_['size']['height'],image_['size']['width']
-                    xywh = [x, y, x1 - x, y1 - y]
-                    pos = bnd_box_to_yolo_box(xywh, [h, w])
-                    with open(join(save_to,name) + ".txt", 'a') as f:
+                    im= Image.open(join(ROOT1,username,category,'Dataset',image_path)).convert('RGB')
+
+                    txt_p= join(ROOT1,username,category,'Dataset',f'{model}_dataset','base','labels','train',f'{name}.txt')
+                    txt_p_for_save= join(f'{model}_dataset','base','labels','train',f'{name}.txt')
+
+                    im_p= join(ROOT1,username,category,'Dataset',f'{model}_dataset','base','images','train',f'{name}.jpg')
+                    im_p_for_save=join(f'{model}_dataset','base','images','train',f'{name}.jpg')
+               
+                    im.save(im_p)
+                    image_for_js = {
+                                        "image_name":basename(im_p),
+                                        "image_path": im_p_for_save,
+                                        "label_path": txt_p_for_save,
+                                        "backup_path": None,
+                                        "status":{"old":None,'current':None,'uncheck':"registered"},
+                                        "create_by": "auto",
+                                        "reg_date": datetime.now().strftime("%Y%m%d%H%M%S"),
+                                        "mod_date": datetime.now().strftime("%Y%m%d%H%M%S"),
+                                        "annotation": [],
+                                        'model_direction':model,
+                                        'category': category,
+                                        'user_id': get_user_id(username),
+                                        }
+                    # x, y, w, h = image_['feature_position']['x'],image_['feature_position']['y'],image_['feature_position']['w'],image_['feature_position']['h']
+                    # im_h,im_w=image_['size']['height'],image_['size']['width']
+                    # xywh = [x, y, w, h]
+                    # pos = bnd_box_to_yolo_box(xywh, [im_h, im_w])
+                    pos=image_['feature_position']
+                  
+                    with open(txt_p, 'a') as f:
                     
-                        f.write(f"{product['class_id']} {pos[0]} {pos[1]} {pos[2]} {pos[3]}\n")
+                        f.write(f"{product['class_id']} {pos['x_center']} {pos['y_center']} {pos['width']} {pos['height']}\n")
+                    
+                
+                    anoo_box = {
+                        "class_id": product['class_id'],
+                        "boxes": [
+                            {
+                                "x_center": float(pos['x_center']),
+                                "y_center": float(pos['y_center']),
+                                "width": float(pos['width']),
+                                "height": float(pos['height'])
+                            }
+                        ],
+                        "status": "activate",
+                    }
+                    image_for_js["annotation"].append(anoo_box)
+                    dataset_coll.insert_one(image_for_js)
+
+                    
         
 
 def bnd_box_to_yolo_box(box, img_size):
@@ -643,18 +839,6 @@ def bnd_box_to_yolo_box(box, img_size):
     return x_center, y_center, w if w < 1 else 1.0, h if h < 1 else 1.0
 
 
-def get_images_for_second_side(images, data,date_=""):
-    if data['status']=="registering":
-        for idx_, im_base64 in enumerate(data['im_base64']):
-            im = base642PIL(im_base64['im_base64'])
-            w, h = im.size
-            x, y, x1, y1 = itemgetter(0, 1, 2, 3)(im_base64['feature_pos'])
-            xywh = [x, y, x1 - x, y1 - y]
-            pos = bnd_box_to_yolo_box(xywh, [h, w])
-            image = {'im': im, 'feature_pos': pos, 'class_id': data['class_id'], 'insert_date': date_,'idx':idx_}
-            images.append(image)
-
-
 def get_images(images, product_ds, class_id=None):
     # TODO check datetime
     for idx_, im_base64 in enumerate(product_ds['image_base64']):
@@ -663,46 +847,6 @@ def get_images(images, product_ds, class_id=None):
         image = {name: im}
         images.append(image)
 
-
-def remove_design():
-    pass
-
-
-def update_status(model=""):
-    try:
-        data = {'model': model, 'status': 'OK'}
-        response = requests.post(url=join(API_URL, 'update_status'), json=data,
-                                 verify=False)
-        if response.text == 'OK':
-            print('UPDATE STATUS OK')
-        else:
-            print('UPDATE STATUS FAIL')
-    except Exception as e:
-        print('UPDATE STATUS ERROR ')
-
-
-def run_with_real_image(data):
-    for im_info in data:
-        if not im_info['STATUS']:
-            # TODO check datetime
-            im = base642PIL(im_info['IMAGE_BASE64'])
-            name = im_info['NAME']
-            if im_info['MODEL'] == 'TOP':
-                save_path = f"/home/upc/WorkSpaces/nam/yakult_project/aiimg_execute/upc/data/web_dataset/top"
-            elif im_info['MODEL'] == 'SIDE':
-                save_path = f"/home/upc/WorkSpaces/nam/yakult_project/aiimg_execute/upc/data/web_dataset/side"
-            else:
-                save_path = f"/home/upc/WorkSpaces/nam/yakult_project/aiimg_execute/upc/data/web_dataset/case"
-            im.save(join(save_path, 'images', 'train', name))
-            with open(join(save_path, 'labels', 'train', name[:-4] + '.txt'), 'a') as f:
-                for k, v in im_info['ANNOTATION'].items():
-                    for pos in v:
-                        f.write(f"{k} {pos[0]} {pos[1]} {pos[2]} {pos[3]}\n")
-            #TODO set design
-            # with open(join(save_path, 'labels', 'for_design', name[:-4] + '-for_ds.txt'), 'a') as f:
-            #     for k, v in im_info['ANNOTATION'].items():
-            #         for pos in v:
-            #             f.write(f"{k} {pos[0]} {pos[1]} {pos[2]} {pos[3]} {pos[4]}\n")
 
 
 def get_data_from_api(URL=None):
@@ -715,32 +859,6 @@ def get_data_from_api(URL=None):
         return None
 
 
-def upload_model(model='', url="https://ucloud.upc.co.jp/cloud/api/ApiFile/PostFiles"):
-    list_model = os.listdir("/home/upc/WorkSpaces/nam/yakult_project/checked_model")
-    model_id = '01' if model == 'top' else '02' if model == 'side' else '03'
-    if len(list_model) > 0:
-        lasted = np.max([int(date) for date in list_model])
-        weight = f"/home/upc/WorkSpaces/nam/yakult_project/checked_model/{lasted}/{model_id}_{lasted}/weights/best.pt"
-        if isfile(weight):
-            with open(weight, 'rb') as f:
-                files = {"data": (None, json.dumps({
-                    "FILE_TYPE": "2",
-                    "NAME": f"model_{model}",
-                    "FILE_NAME": f"NSJ_0{model_id}.pt",
-                    "FILE_PATH": "C:\\UPC\\uscan\\data\\assets\\models",
-                    # "RELEASE_DATE": datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
-                    "RELEASE_DATE": None,
-                    "MEMO": "TEST"}), "application/json"),
-                         "FILE": (f"NSJ_0{model_id}.pt", f, "application/octet-stream")
-                         }
-                response = requests.post(url=url, files=files,
-                                         verify=False)
-            print(response)
-            update_status(model=model)
-        else:
-            print("MODEL FILE IS NOT EXIST TO UPLOAD")
-
-
 def converse2jpg(path):
     for f in path:
         if f.endswith('png'):
@@ -751,8 +869,367 @@ def converse2jpg(path):
 
 @app.route('/')
 def aiimg_execute():
-    return 'This is Flask Server for train Yolov5 '
+    return 'This is Flask Server for train Yolov5'
 
+
+
+
+def bnd_box_to_yolo_box(box, img_size):
+    """
+    It takes a bounding box and an image size and returns the YOLO box
+
+    :param box: the bounding box in the format (x_min, y_min, w, h)
+    :param img_size: The size of the image
+    :return: x_center, y_center, w, h
+    """
+    (x_min, y_min) = (box[0], box[1])
+    (w, h) = (box[2], box[3])
+    x_max = x_min + w
+    y_max = y_min + h
+
+    x_center = float((x_min + x_max)) / 2 / img_size[1]
+    y_center = float((y_min + y_max)) / 2 / img_size[0]
+
+    w = float((x_max - x_min)) / img_size[1]
+    h = float((y_max - y_min)) / img_size[0]
+
+    return x_center, y_center, w if w < 1 else 1.0, h if h < 1 else 1.0
+
+
+def toImgOpenCV(img_pil):  # Converse imgPIL to imgOpenCV
+    """
+    Convert a PIL image to an OpenCV image by swapping the red and blue channels
+
+    :param img_pil: The image to be converted
+    :return: A numpy array
+    """
+    i = np.array(img_pil)  # After mapping from PIL to numpy : [R,G,B,A]
+    # numpy Image Channel system: [B,G,R,A]
+    red = i[:, :, 0].copy()
+    i[:, :, 0] = i[:, :, 2].copy()
+    i[:, :, 2] = red
+    return i
+
+
+def w_h_image_rotate(image):
+    """
+    It takes an image, converts it to RGBA, then converts it to RGB, then converts it to grayscale, then
+    finds the largest contour, then returns the bounding box of that contour
+
+    :param image: the image to be cropped
+    :return: the x, y, width, and height of the image.
+    """
+    im = toImgOpenCV(image)
+    im_to_crop = toImgOpenCV(image)
+
+    alpha_channel = im[:, :, 3]
+    rgb_channel = im[:, :, :3]
+    white_background = np.ones_like(rgb_channel, dtype=np.uint8) * 255
+
+    alpha_factor = alpha_channel[:, :, np.newaxis].astype(np.float32) / 255.0
+    alpha_factor = np.concatenate((alpha_factor, alpha_factor, alpha_factor), axis=2)
+
+    base = rgb_channel.astype(np.float32) * alpha_factor
+    white = white_background.astype(np.float32) * (1 - alpha_factor)
+    final_im = base + white
+    final_im = final_im.astype(np.uint8)
+
+    gray = cv2.cvtColor(final_im, cv2.COLOR_BGR2GRAY)
+    r1, t1 = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+    # t1=cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY,11,2)
+    c1, h1 = cv2.findContours(t1, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    cnt = sorted(c1, key=cv2.contourArea, reverse=True)
+    x, y, w, h = cv2.boundingRect(cnt[0])
+    return x, y, (x + w), (y + h)
+
+
+def class_id(file):
+    files = file.split("_")
+    return str(files[0])
+
+
+def design_id(file):
+    files = file.split("_")  # x-x-resize
+    return str(files[1]).split("-")[0]
+
+
+class MergeThread(threading.Thread):
+    def __init__(
+        self,
+        bgs,
+        fgs,
+        model=None,
+        rotate=None,
+        rotate_step=10,
+        cutout_=False,
+        DATA_TRANSFER=None
+    ):
+        super(MergeThread, self).__init__()
+        self.fgs = fgs
+        self.bgs = bgs
+        self.rotate = rotate
+        self.rotate_step = rotate_step
+        self.cutout = cutout_
+        self.model = model
+        self.DATA_TRANSFER = DATA_TRANSFER
+
+    def run(self):  # Get list foregrounds
+        overlap_value = 10  # Overlap value
+        idx = 0  # Image index
+        while True:
+            if len(self.fgs) == 0:
+                break
+            bg = random.choice(
+                self.bgs
+            )  # Random choice one of background in list backgrounds
+            merged_image = bg.copy()
+            bw, bh = merged_image.size  # Get weight height of merge image
+            cur_h, cur_w, max_h, max_w = 0, 0, 0, 0
+            name_=uuid.uuid4()
+            txt_p = join(self.DATA_TRANSFER['DATA_ROOT'], f"{self.model}_dataset", "base", "labels", "train",f"{name_}.txt", )
+            txt_p_save = (
+                rf"{self.model}_dataset\base\labels\train\{name_}.txt"
+            )
+
+            im_p = join(
+                self.DATA_TRANSFER['DATA_ROOT'],
+                f"{self.model}_dataset",
+                "base",
+                "images",
+                "train",
+                f"{name_}.jpg",
+            )
+            im_p_save = (
+                rf"{self.model}_dataset\base\images\train\{name_}.jpg"
+            )
+            image_for_js = {
+                "image_name": basename(im_p),
+                "image_path": im_p_save,
+                "label_path": txt_p_save,
+                "backup_path": None,
+                "status":{"old":None,'current':None,'uncheck':"registered"},
+                "create_by": "auto",
+                "reg_date": datetime.now().strftime("%Y%m%d%H%M%S"),
+                "mod_date": datetime.now().strftime("%Y%m%d%H%M%S"),
+                "annotation": [],
+                'model_direction':self.model,
+                'category':self.DATA_TRANSFER['category'],
+                'user_id': self.DATA_TRANSFER['user_id'],
+            }
+            while True:
+                if len(self.fgs) == 0: 
+                    break
+
+                # Random choice foreground
+                fg_dic = random.choice(self.fgs) 
+
+                  # Get id of product
+                id_ = class_id(list(fg_dic.keys())[0])
+                fore_image = list(fg_dic.values())[0]
+                if self.rotate is not None:
+                    fore_image = fore_image.rotate(
+                        random.randrange(0, int(self.rotate), self.rotate_step),
+                        expand=True,
+                    )
+                    fore_image = fore_image.crop(w_h_image_rotate(fore_image))
+                if self.cutout:
+                    fore_image = cutout(fore_image, is_pil=True)
+                fw, fh = fore_image.size  # Foreground size
+                if fw > bw or fh > bh:
+                    self.fgs.remove(fg_dic)
+                    continue
+                if max_h < fh:
+                    max_h = fh - overlap_value
+                if (cur_w + fw) >= bw:
+                    cur_w = 0
+                    cur_h += max_h
+                if (cur_h + fh) >= bh:
+                    break
+                if cur_w > 0:
+                    if cur_h == 0:
+                        merged_image.paste(
+                            fore_image, (cur_w - overlap_value, cur_h), fore_image
+                        )
+                        x, y = cur_w - overlap_value, cur_h
+                    else:
+                        merged_image.paste(
+                            fore_image, (cur_w, cur_h - overlap_value), fore_image
+                        )
+                        x, y = cur_w, cur_h - overlap_value
+                else:
+                    merged_image.paste(fore_image, (cur_w, cur_h), fore_image)
+                    x, y = cur_w, cur_h
+                box = (x, y, fw, fh)
+                yolo_box = bnd_box_to_yolo_box(
+                    box, (bh, bw)
+                )  # Converse Bounding Box(xywh) to Yolo format(xyxy)
+                cls = int(id_)
+                with open(txt_p, "a") as f:
+                    f.write(
+                        f"{cls} {yolo_box[0]} {yolo_box[1]} {yolo_box[2]} {yolo_box[3]}\n"
+                    )
+
+                class_id_list = [int(anno["class_id"]) for anno in image_for_js["annotation"]]
+                if int(cls) in class_id_list:
+                    for anoo in image_for_js["annotation"]:
+                        if int(anoo["class_id"]) == int(cls):
+                            position = {
+                                "x_center": float(yolo_box[0]),
+                                "y_center": float(yolo_box[1]),
+                                "width": float(yolo_box[2]),
+                                "height": float(yolo_box[3])
+                            }
+                            anoo["boxes"].append(position)
+
+                            break
+                else:
+                    anoo_box = {
+                        "class_id": int(cls),
+                        "boxes": [
+                            {
+                                "x_center": float(yolo_box[0]),
+                                "y_center": float(yolo_box[1]),
+                                "width": float(yolo_box[2]),
+                                "height": float(yolo_box[3])
+                            }
+                        ],
+                        "status": "activate",
+                    }
+                    image_for_js["annotation"].append(anoo_box)
+
+                # TODO : set design
+                # with open(name + "-for_ds.txt", 'a') as f:
+                #     f.write(f"{cls} {yolo_box[0]} {yolo_box[1]} {yolo_box[2]} {yolo_box[3]} {design_id_}\n")
+                cur_w += fw - overlap_value
+                self.fgs.remove(fg_dic)
+
+            # merged_image.save(name + ".png", format="png")
+            merged_image_opencv = toImgOpenCV(merged_image)
+            transform = A.Compose([A.RandomBrightnessContrast()])
+            image = cv2.cvtColor(merged_image_opencv, cv2.COLOR_BGR2RGB)
+            transformed = transform(image=image)
+            transformed_image = transformed["image"]
+            transformed_image = cv2.cvtColor(transformed_image, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(im_p, transformed_image)
+            
+            if isfile(txt_p):
+                with threading.Lock():
+                    dataset_coll.insert_one(image_for_js)
+            idx += 1
+
+
+def resize(
+    registing_products, min_size=0.7, max_size=1.2, step=0.1, im_num=5, DATA_ROOT=None
+):
+    resized_images = {}
+
+    for product in registing_products:
+        for idx, image_ in enumerate(product["images"]):
+            name = f"{product['class_id']}_-{str(idx)}"
+            image_path = image_["image_path"].replace("\\", "/")
+            im = Image.open(join(DATA_ROOT, image_path)).convert("RGBA")
+
+            for i in np.arange(min_size, max_size, step):
+                width, height = im.size
+                aspect_ratio = width / height
+                new_width = width * i
+                new_height = round(new_width / aspect_ratio)
+                im_rs = im.resize(
+                    (round(new_width), new_height), resample=Image.LANCZOS
+                )
+                range_ = (
+                    range(1, im_num + 5, 1)
+                    if round(i, 1) == 1.0
+                    else range(1, im_num, 1)
+                )
+                for j in range_:
+                    im_name = f"{name}-resize_{round(i, 1)}_{j}.jpg"
+                    resized_images[im_name] = im_rs
+
+    return resized_images
+
+
+def merge_thread(
+    foregrounds,
+    backgrounds,
+    model=None,
+    rotate_=None,
+    rotate_step=None,
+    cutout_=False,
+    DATA_TRANSFER=None
+):
+    dic_by_size = {}
+    threads = []
+    for im_name, im in foregrounds.items():
+        image_names = im_name.split("-")
+        sizes = str(str(image_names[2]).split("_")[1])
+        if sizes not in dic_by_size.keys():
+            im_ = {im_name: im}
+            dic_by_size[sizes] = [im_]
+        else:
+            im_ = {im_name: im}
+            dic_by_size[sizes].append(im_)
+
+    for v in dic_by_size.values():
+        t = MergeThread(
+            bgs=backgrounds,
+            fgs=v,
+            model=model,
+            rotate=rotate_,
+            rotate_step=rotate_step,
+            cutout_=cutout_,
+            DATA_TRANSFER=DATA_TRANSFER
+        )
+        threads.append(t)
+        t.start()
+    for th in threads:
+        th.join()
+
+
+def cutout(im, is_pil=False):
+    """
+    It takes an image and randomly selects a square region of the image to replace with a random color
+
+    :param im: the image to be cutout
+    :param is_pil: whether the input image is a PIL image or a numpy array, defaults to False (optional)
+    :return: the image with the cutout applied.
+    """
+    if is_pil:
+        w, h = im.size
+        scales = [0.5] * 1 + [0.25] * 2 + [0.125] * 2
+        s = random.choice(scales)
+        mask_h = random.randint(1, int(h * s))  # create random masks
+        mask_w = random.randint(1, int(w * s))
+
+        # box
+        xmin = max(0, random.randint(0, w) - mask_w // 2)
+        ymin = max(0, random.randint(0, h) - mask_h // 2)
+        img = Image.new(
+            "RGBA",
+            (mask_w, mask_h),
+            (random.randint(64, 191), random.randint(64, 191), random.randint(64, 191)),
+        )
+        im.paste(img, (xmin, ymin), img)
+        return im
+
+    else:
+        h, w = im.shape[:2]
+        # scales = [0.5] * 1 + [0.25] * 2 + [0.125] * 4 + [0.0625] * 8 + [0.03125] * 16  # image size fraction
+        scales = [0.5] * 1 + [0.25] * 2 + [0.125] * 2
+        s = random.choice(scales)
+        mask_h = random.randint(1, int(h * s))  # create random masks
+        mask_w = random.randint(1, int(w * s))
+
+        # box
+        xmin = max(0, random.randint(0, w) - mask_w // 2)
+        ymin = max(0, random.randint(0, h) - mask_h // 2)
+        xmax = min(w, xmin + mask_w)
+        ymax = min(h, ymin + mask_h)
+
+        # apply random color mask
+        im[ymin:ymax, xmin:xmax] = [random.randint(64, 191) for _ in range(4)]
+        return im
 
 # endregion
 

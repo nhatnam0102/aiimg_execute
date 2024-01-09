@@ -1,5 +1,4 @@
-
-
+from datetime import datetime
 import cv2
 import numpy as np
 from PIL import Image, JpegImagePlugin
@@ -7,13 +6,19 @@ import random
 import threading
 from os.path import join
 import albumentations as A
-# from pathlib import Path
+import uuid
 
+# from pathlib import Path
+from os.path import join, basename, isfile, isdir
+
+ROOT = r"/var/www/html/aiimg_execute"
+DATA_ROOT = r"/var/www/html/aiimg_execute/Data/UPCTEST/Dataset"
+MODEL_ROOT = r"/var/www/html/aiimg_execute/Data/UPCTEST/Model"
 
 def bnd_box_to_yolo_box(box, img_size):
     """
     It takes a bounding box and an image size and returns the YOLO box
-    
+
     :param box: the bounding box in the format (x_min, y_min, w, h)
     :param img_size: The size of the image
     :return: x_center, y_center, w, h
@@ -35,7 +40,7 @@ def bnd_box_to_yolo_box(box, img_size):
 def toImgOpenCV(img_pil):  # Converse imgPIL to imgOpenCV
     """
     Convert a PIL image to an OpenCV image by swapping the red and blue channels
-    
+
     :param img_pil: The image to be converted
     :return: A numpy array
     """
@@ -51,7 +56,7 @@ def w_h_image_rotate(image):
     """
     It takes an image, converts it to RGBA, then converts it to RGB, then converts it to grayscale, then
     finds the largest contour, then returns the bounding box of that contour
-    
+
     :param image: the image to be cropped
     :return: the x, y, width, and height of the image.
     """
@@ -87,41 +92,89 @@ def class_id(file):
 
 def design_id(file):
     files = file.split("_")  # x-x-resize
-    return str(files[1]).split('-')[0]
+    return str(files[1]).split("-")[0]
 
 
 class MergeThread(threading.Thread):
-    def __init__(self, bgs, fgs, rotate=None, rotate_step=10, cutout_=False, save_path="", file_name="merged"):
+    def __init__(
+        self,
+        bgs,
+        fgs,
+        model=None,
+        rotate=None,
+        rotate_step=10,
+        cutout_=False,
+        DATA_TRANSFER=None
+    ):
         super(MergeThread, self).__init__()
         self.fgs = fgs
         self.bgs = bgs
         self.rotate = rotate
         self.rotate_step = rotate_step
         self.cutout = cutout_
-        self.save_path = save_path
-        self.file_name = file_name
+        self.model = model
+        self.DATA_TRANSFER = DATA_TRANSFER
 
     def run(self):  # Get list foregrounds
         overlap_value = 10  # Overlap value
         idx = 0  # Image index
-        name = "no_name"
         while True:
             if len(self.fgs) == 0:
                 break
-            bg = random.choice(self.bgs)  # Random choice one of background in list backgrounds
+            bg = random.choice(
+                self.bgs
+            )  # Random choice one of background in list backgrounds
             merged_image = bg.copy()
             bw, bh = merged_image.size  # Get weight height of merge image
             cur_h, cur_w, max_h, max_w = 0, 0, 0, 0
+            name_=uuid.uuid4()
+            txt_p = join(self.DATA_TRANSFER['DATA_ROOT'], f"{self.model}_dataset", "base", "labels", "train",f"{name_}.txt", )
+            txt_p_save = (
+                rf"{self.model}_dataset\base\labels\train\{name_}.txt"
+            )
+
+            im_p = join(
+                DATA_ROOT,
+                f"{self.model}_dataset",
+                "base",
+                "images",
+                "train",
+                f"{name_}.jpg",
+            )
+            im_p_save = (
+                rf"{self.model}_dataset\base\images\train\{name_}.jpg"
+            )
+            image_for_js = {
+                "image_name": basename(im_p),
+                "image_path": im_p_save,
+                "label_path": txt_p_save,
+                "backup_path": None,
+                "dependent_by": "uncheck",
+                "create_by": "auto",
+                "reg_date": datetime.now().strftime("%Y%m%d%H%M%S"),
+                "mod_date": datetime.now().strftime("%Y%m%d%H%M%S"),
+                "annotation": [],
+                'model_direction':self.model,
+                'user_id': self.DATA_TRANSFER['user_id'],
+            }
             while True:
-                if len(self.fgs) == 0:  # Break when len of list foreground == 0
-                    # Break when len of list foreground == 0
+                if len(self.fgs) == 0: 
                     break
-                fg_dic = random.choice(self.fgs)  # Random choice foreground
-                id_ = class_id(list(fg_dic.keys())[0])  # Get id of product
-                design_id_ = design_id(list(fg_dic.keys())[0])  # Get design id of product
+
+                # Random choice foreground
+                fg_dic = random.choice(self.fgs) 
+
+                  # Get id of product
+                id_ = class_id(list(fg_dic.keys())[0])
+
+                # Get design id of product
+                design_id_ = design_id(list(fg_dic.keys())[0])  
                 fore_image = list(fg_dic.values())[0]
                 if self.rotate is not None:
-                    fore_image = fore_image.rotate(random.randrange(0, int(self.rotate), self.rotate_step), expand=True)
+                    fore_image = fore_image.rotate(
+                        random.randrange(0, int(self.rotate), self.rotate_step),
+                        expand=True,
+                    )
                     fore_image = fore_image.crop(w_h_image_rotate(fore_image))
                 if self.cutout:
                     fore_image = cutout(fore_image, is_pil=True)
@@ -138,22 +191,57 @@ class MergeThread(threading.Thread):
                     break
                 if cur_w > 0:
                     if cur_h == 0:
-                        merged_image.paste(fore_image, (cur_w - overlap_value, cur_h), fore_image)
+                        merged_image.paste(
+                            fore_image, (cur_w - overlap_value, cur_h), fore_image
+                        )
                         x, y = cur_w - overlap_value, cur_h
                     else:
-                        merged_image.paste(fore_image, (cur_w, cur_h - overlap_value), fore_image)
+                        merged_image.paste(
+                            fore_image, (cur_w, cur_h - overlap_value), fore_image
+                        )
                         x, y = cur_w, cur_h - overlap_value
                 else:
                     merged_image.paste(fore_image, (cur_w, cur_h), fore_image)
                     x, y = cur_w, cur_h
                 box = (x, y, fw, fh)
-                yolo_box = bnd_box_to_yolo_box(box, (bh, bw))  # Converse Bounding Box(xywh) to Yolo format(xyxy)
+                yolo_box = bnd_box_to_yolo_box(
+                    box, (bh, bw)
+                )  # Converse Bounding Box(xywh) to Yolo format(xyxy)
                 cls = int(id_)
-                name = join(self.save_path, f"{self.file_name}_{idx}")
-                with open(name + ".txt", 'a') as f:
-                    f.write(f"{cls} {yolo_box[0]} {yolo_box[1]} {yolo_box[2]} {yolo_box[3]}\n")
+                with open(txt_p, "a") as f:
+                    f.write(
+                        f"{cls} {yolo_box[0]} {yolo_box[1]} {yolo_box[2]} {yolo_box[3]}\n"
+                    )
 
-                #TODO : set design
+                class_id_list = [int(anno["class_id"]) for anno in image_for_js["annotation"]]
+                if int(cls) in class_id_list:
+                    for anoo in image_for_js["annotation"]:
+                        if int(anoo["class_id"]) == int(cls):
+                            position = {
+                                "x_center": float(yolo_box[0]),
+                                "y_center": float(yolo_box[1]),
+                                "width": float(yolo_box[2]),
+                                "height": float(yolo_box[3])
+                            }
+                            anoo["boxes"].append(position)
+
+                            break
+                else:
+                    anoo_box = {
+                        "class_id": int(cls),
+                        "boxes": [
+                            {
+                                "x_center": float(yolo_box[0]),
+                                "y_center": float(yolo_box[1]),
+                                "width": float(yolo_box[2]),
+                                "height": float(yolo_box[3])
+                            }
+                        ],
+                        "status": "activate",
+                    }
+                    image_for_js["annotation"].append(anoo_box)
+
+                # TODO : set design
                 # with open(name + "-for_ds.txt", 'a') as f:
                 #     f.write(f"{cls} {yolo_box[0]} {yolo_box[1]} {yolo_box[2]} {yolo_box[3]} {design_id_}\n")
                 cur_w += fw - overlap_value
@@ -161,21 +249,25 @@ class MergeThread(threading.Thread):
 
             # merged_image.save(name + ".png", format="png")
             merged_image_opencv = toImgOpenCV(merged_image)
-            transform = A.Compose([
-                A.RandomBrightnessContrast(),
-                A.Blur()])
+            transform = A.Compose([A.RandomBrightnessContrast()])
             image = cv2.cvtColor(merged_image_opencv, cv2.COLOR_BGR2RGB)
             transformed = transform(image=image)
             transformed_image = transformed["image"]
             transformed_image = cv2.cvtColor(transformed_image, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(name + ".jpg", transformed_image)
+            cv2.imwrite(im_p, transformed_image)
+            
+            if isfile(txt_p):
+                with threading.Lock():
+                    self.dataset.append(image_for_js)
             idx += 1
 
 
-def resize(registing_products, min_size=0.7, max_size=1.2, step=0.1, im_num=5,DATA_ROOT=None):
+def resize(
+    registing_products, min_size=0.7, max_size=1.2, step=0.1, im_num=5, DATA_ROOT=None
+):
     """
     It takes a dictionary of images, resizes them, and returns a dictionary of resized images
-    
+
     :param images: a dictionary of images
     :param min_size: the minimum size of the image to resize to
     :param max_size: the maximum size of the image
@@ -184,24 +276,29 @@ def resize(registing_products, min_size=0.7, max_size=1.2, step=0.1, im_num=5,DA
     :return: A dictionary of images with the key being the image name and the value being the image.
     """
     resized_images = {}
-    registing_ids=[product['class_id'] for product in registing_products]
+    registing_ids = [product["class_id"] for product in registing_products]
 
     for product in registing_products:
-        for design in product['design']:
-            for idx,image_ in enumerate(design['images']):
+        for design in product["design"]:
+            for idx, image_ in enumerate(design["images"]):
                 name = f"{product['class_id']}_{design['design_id']}-{str(idx)}"
-                print(DATA_ROOT)
-                print(image_['image_path'])
-                image_path =image_['image_path'].replace('\\','/')
-                im= Image.open(join(DATA_ROOT,image_path)).convert('RGBA')
+                print(image_["image_path"])
+                image_path = image_["image_path"].replace("\\", "/")
+                im = Image.open(join(DATA_ROOT, image_path)).convert("RGBA")
 
                 for i in np.arange(min_size, max_size, step):
                     width, height = im.size
                     aspect_ratio = width / height
                     new_width = width * i
                     new_height = round(new_width / aspect_ratio)
-                    im_rs = im.resize((round(new_width), new_height), resample=Image.LANCZOS)
-                    range_ = range(1, im_num + 5, 1) if round(i, 1) == 1.0 else range(1, im_num, 1)
+                    im_rs = im.resize(
+                        (round(new_width), new_height), resample=Image.LANCZOS
+                    )
+                    range_ = (
+                        range(1, im_num + 5, 1)
+                        if round(i, 1) == 1.0
+                        else range(1, im_num, 1)
+                    )
                     for j in range_:
                         im_name = f"{name}-resize_{round(i, 1)}_{j}.jpg"
                         resized_images[im_name] = im_rs
@@ -209,11 +306,19 @@ def resize(registing_products, min_size=0.7, max_size=1.2, step=0.1, im_num=5,DA
     return resized_images
 
 
-def merge_thread(foregrounds, backgrounds, p_save, rotate_=None, rotate_step=None, cutout_=False, name=None):
+def merge_thread(
+    foregrounds,
+    backgrounds,
+    model=None,
+    rotate_=None,
+    rotate_step=None,
+    cutout_=False,
+    DATA_TRANSFER=None
+):
     """
     It takes a dictionary of foregrounds and a dictionary of backgrounds, and creates a thread for each
     foreground size, and then merges the foregrounds of that size with the backgrounds
-    
+
     :param foregrounds: a dictionary of foreground images
     :param backgrounds: a dictionary of background images
     :param p_save: the path to save the merged images
@@ -227,7 +332,7 @@ def merge_thread(foregrounds, backgrounds, p_save, rotate_=None, rotate_step=Non
     threads = []
     for im_name, im in foregrounds.items():
         image_names = im_name.split("-")
-        sizes = str(str(image_names[2]).split('_')[1])
+        sizes = str(str(image_names[2]).split("_")[1])
         if sizes not in dic_by_size.keys():
             im_ = {im_name: im}
             dic_by_size[sizes] = [im_]
@@ -235,14 +340,16 @@ def merge_thread(foregrounds, backgrounds, p_save, rotate_=None, rotate_step=Non
             im_ = {im_name: im}
             dic_by_size[sizes].append(im_)
 
-    for k, v in dic_by_size.items():
-        t = MergeThread(bgs=backgrounds,
-                        fgs=v,
-                        rotate=rotate_,
-                        rotate_step=rotate_step,
-                        cutout_=cutout_,
-                        save_path=p_save,
-                        file_name=f"{name}_{k}")
+    for v in dic_by_size.values():
+        t = MergeThread(
+            bgs=backgrounds,
+            fgs=v,
+            model=model,
+            rotate=rotate_,
+            rotate_step=rotate_step,
+            cutout_=cutout_,
+            DATA_TRANSFER=DATA_TRANSFER
+        )
         threads.append(t)
         t.start()
     for th in threads:
@@ -252,7 +359,7 @@ def merge_thread(foregrounds, backgrounds, p_save, rotate_=None, rotate_step=Non
 def cutout(im, is_pil=False):
     """
     It takes an image and randomly selects a square region of the image to replace with a random color
-    
+
     :param im: the image to be cutout
     :param is_pil: whether the input image is a PIL image or a numpy array, defaults to False (optional)
     :return: the image with the cutout applied.
@@ -267,8 +374,11 @@ def cutout(im, is_pil=False):
         # box
         xmin = max(0, random.randint(0, w) - mask_w // 2)
         ymin = max(0, random.randint(0, h) - mask_h // 2)
-        img = Image.new("RGBA", (mask_w, mask_h),
-                        (random.randint(64, 191), random.randint(64, 191), random.randint(64, 191)))
+        img = Image.new(
+            "RGBA",
+            (mask_w, mask_h),
+            (random.randint(64, 191), random.randint(64, 191), random.randint(64, 191)),
+        )
         im.paste(img, (xmin, ymin), img)
         return im
 
